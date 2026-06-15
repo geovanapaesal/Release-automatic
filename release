@@ -1,0 +1,52 @@
+name: Release Automation — Amigo Flow
+
+on:
+  schedule:
+    # Toda quarta às 10h e sexta às 10h (horário de Brasília = UTC-3, então 13h UTC)
+    - cron: "0 13 * * 3"
+    - cron: "0 13 * * 5"
+  # Permite rodar manualmente pela interface do GitHub Actions
+  workflow_dispatch:
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # necessário para commitar o arquivo de estado
+
+    steps:
+      - name: Checkout repositório
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependências
+        run: pip install requests
+
+      - name: Executar automação de release
+        env:
+          JIRA_DOMAIN:            ${{ secrets.JIRA_DOMAIN }}
+          JIRA_EMAIL:             ${{ secrets.JIRA_EMAIL }}
+          JIRA_TOKEN:             ${{ secrets.JIRA_TOKEN }}
+          JIRA_PROJECT:           ${{ secrets.JIRA_PROJECT }}
+          JIRA_STATUS:            ${{ secrets.JIRA_STATUS }}
+          JIRA_DAYS:              ${{ secrets.JIRA_DAYS }}
+          ANTHROPIC_API_KEY:      ${{ secrets.ANTHROPIC_API_KEY }}
+          GITBOOK_TOKEN:          ${{ secrets.GITBOOK_TOKEN }}
+          GITBOOK_SPACE_ID:       ${{ secrets.GITBOOK_SPACE_ID }}
+          GITBOOK_PARENT_PAGE_ID: ${{ secrets.GITBOOK_PARENT_PAGE_ID }}
+          SLACK_BOT_TOKEN:        ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID:       ${{ secrets.SLACK_CHANNEL_ID }}
+        run: python scripts/release_automation.py
+
+      - name: Salvar estado de issues publicadas
+        if: always()
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add scripts/published_issues.json
+          git diff --cached --quiet || git commit -m "chore: atualiza issues publicadas [skip ci]"
+          git push
