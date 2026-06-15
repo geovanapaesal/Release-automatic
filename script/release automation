@@ -1,0 +1,279 @@
+"""
+Amigo Flow — Automação de Release
+Busca histórias Done no Jira → gera conteúdo com Claude → publica no GitBook + Slack.
+"""
+
+import os
+import json
+import requests
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Configuração — lida de variáveis de ambiente (GitHub Secrets)
+# ---------------------------------------------------------------------------
+
+JIRA_DOMAIN   = os.environ["JIRA_DOMAIN"]          # ex: amigotech.atlassian.net
+JIRA_EMAIL    = os.environ["JIRA_EMAIL"]
+JIRA_TOKEN    = os.environ["JIRA_TOKEN"]
+JIRA_PROJECT  = os.environ.get("JIRA_PROJECT", "GREEN")
+JIRA_STATUS   = os.environ.get("JIRA_STATUS", "Done")
+JIRA_DAYS     = int(os.environ.get("JIRA_DAYS", "4"))  # janela de busca
+
+ANTHROPIC_KEY = os.environ["ANTHROPIC_API_KEY"]
+
+GITBOOK_TOKEN  = os.environ["GITBOOK_TOKEN"]
+GITBOOK_SPACE  = os.environ["GITBOOK_SPACE_ID"]
+GITBOOK_PARENT = os.environ.get("GITBOOK_PARENT_PAGE_ID", "")  # opcional
+
+SLACK_TOKEN   = os.environ["SLACK_BOT_TOKEN"]
+SLACK_CHANNEL = os.environ["SLACK_CHANNEL_ID"]
+
+# ---------------------------------------------------------------------------
+# Controle de duplicatas — arquivo de estado local (commitado ou em cache)
+# ---------------------------------------------------------------------------
+
+STATE_FILE = Path("scripts/published_issues.json")
+
+def load_published() -> set:
+    if STATE_FILE.exists():
+        return set(json.loads(STATE_FILE.read_text()))
+    return set()
+
+def save_published(keys: set):
+    STATE_FILE.write_text(json.dumps(sorted(keys), indent=2))
+
+# ---------------------------------------------------------------------------
+# Jira
+# ---------------------------------------------------------------------------
+
+def fetch_done_stories() -> list[dict]:
+    since = (datetime.now(timezone.utc) - timedelta(days=JIRA_DAYS)).strftime("%Y-%m-%d")
+    jql = (
+        f'project = "{JIRA_PROJECT}" '
+        f'AND issuetype = Story '
+        f'AND status = "{JIRA_STATUS}" '
+        f'AND updated >= "{since}" '
+        f'ORDER BY updated DESC'
+    )
+    url = f"https://{JIRA_DOMAIN}/rest/api/3/search"
+    params = {
+        "jql": jql,
+        "maxResults": 20,
+        "fields": "summary,description,comment,fixVersions,labels,assignee,updated",
+    }
+    resp = requests.get(
+        url,
+        params=params,
+        auth=(JIRA_EMAIL, JIRA_TOKEN),
+        headers={"Accept": "application/json"},
+        timeout=20,
+    )
+    resp.raise_for_status()
+    return resp.json().get("issues", [])
+
+
+def extract_text(adf_node) -> str:
+    """Extrai texto plano de um campo ADF (Atlassian Document Format)."""
+    if not adf_node:
+        return ""
+    parts = []
+    for block in adf_node.get("content", []):
+        for inline in block.get("content", []):
+            if inline.get("type") == "text":
+                parts.append(inline.get("text", ""))
+        parts.append("\n")
+    return " ".join(parts).strip()
+
+
+def build_issue_context(issue: dict) -> str:
+    fields = issue["fields"]
+    summary    = fields.get("summary", "Sem título")
+    desc       = extract_text(fields.get("description"))
+    versions   = ", ".join(v["name"] for v in fields.get("fixVersions", []))
+    labels     = ", ".join(fields.get("labels", []))
+    updated    = fields.get("updated", "")[:10]
+
+    return (
+        f"Issue: {issue['key']}\n"
+        f"Título: {summary}\n"
+        f"Versão: {versions or 'não informada'}\n"
+        f"Labels: {labels or 'nenhuma'}\n"
+        f"Atualizada em: {updated}\n"
+        f"Descrição:\n{desc or '(sem descrição)'}"
+    )
+
+# ---------------------------------------------------------------------------
+# Claude (Anthropic)
+# ---------------------------------------------------------------------------
+
+SYSTEM_GITBOOK = """Você é especialista em documentação de produto do Amigo Flow, plataforma WhatsApp para clínicas de saúde no Brasil.
+
+Com base nos dados da issue Jira, crie uma página de documentação clara para o GitBook.
+
+Estrutura obrigatória (use exatamente estes cabeçalhos Markdown):
+
+## O que é
+(1-2 parágrafos explicando o que a feature faz, sem jargão técnico)
+
+## Como usar
+(Passo a passo numerado, orientado ao usuário da clínica)
+
+## Impactos e cuidados
+(O que muda no fluxo existente, pontos de atenção)
+
+Use linguagem simples, direta e próxima. Foco no benefício para a clínica. Não inclua o número da issue no corpo do texto."""
+
+
+SYSTEM_SLACK = """Você é especialista em comunicação de produto do Amigo Flow com voz de product marketing.
+
+Com base nos dados da issue Jira, crie um comunicado de release notes para o canal Slack da equipe.
+
+Estrutura obrigatória (use exatamente este formato):
+
+✨ *[Nome da feature — título curto e direto]*
+[1 frase de impacto — o benefício principal para a clínica]
+
+*O que mudou:*
+• [bullet 1 — foco no usuário, não no técnico]
+• [bullet 2]
+• [bullet 3, se houver]
+
+*Disponível para:* Todos os clientes Amigo Flow
+*Data:* [data de hoje no formato DD/MM/AAAA]
+
+Tom: confiante, próximo, sem exageros. Use *negrito* do Slack para destaques. Sem emojis extras além do ✨ inicial. Máximo de 200 palavras."""
+
+
+def generate_content(system_prompt: str, issue_context: str) -> str:
+    resp = requests.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={
+            "x-api-key": ANTHROPIC_KEY,
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 1024,
+            "system": system_prompt,
+            "messages": [{"role": "user", "content": issue_context}],
+        },
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return next(
+        (b["text"] for b in data.get("content", []) if b["type"] == "text"),
+        ""
+    )
+
+# ---------------------------------------------------------------------------
+# GitBook
+# ---------------------------------------------------------------------------
+
+def create_gitbook_page(title: str, markdown_body: str) -> str:
+    """Cria uma página no GitBook e retorna o ID da página criada."""
+    url = f"https://api.gitbook.com/v1/spaces/{GITBOOK_SPACE}/content/page"
+    payload = {
+        "title": title,
+        "document": {
+            "object": "document",
+            "nodes": [
+                {
+                    "object": "block",
+                    "type": "markdown",
+                    "data": {"body": markdown_body},
+                }
+            ],
+        },
+    }
+    if GITBOOK_PARENT:
+        payload["parent"] = GITBOOK_PARENT
+
+    resp = requests.post(
+        url,
+        headers={
+            "Authorization": f"Bearer {GITBOOK_TOKEN}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=20,
+    )
+    resp.raise_for_status()
+    return resp.json().get("id", "?")
+
+# ---------------------------------------------------------------------------
+# Slack
+# ---------------------------------------------------------------------------
+
+def post_slack_message(text: str) -> str:
+    resp = requests.post(
+        "https://slack.com/api/chat.postMessage",
+        headers={
+            "Authorization": f"Bearer {SLACK_TOKEN}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "channel": SLACK_CHANNEL,
+            "text": text,
+            "unfurl_links": False,
+        },
+        timeout=20,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if not data.get("ok"):
+        raise RuntimeError(f"Slack error: {data.get('error')}")
+    return data.get("ts", "?")
+
+# ---------------------------------------------------------------------------
+# Orquestrador principal
+# ---------------------------------------------------------------------------
+
+def main():
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M')}] Iniciando automação de release...")
+
+    published = load_published()
+    issues    = fetch_done_stories()
+
+    if not issues:
+        print(f"Nenhuma história Done encontrada nos últimos {JIRA_DAYS} dias. Encerrando.")
+        return
+
+    novas = [i for i in issues if i["key"] not in published]
+    print(f"Issues encontradas: {len(issues)} | Novas (não publicadas): {len(novas)}")
+
+    if not novas:
+        print("Todas as issues já foram publicadas anteriormente. Nada a fazer.")
+        return
+
+    for issue in novas:
+        key     = issue["key"]
+        summary = issue["fields"].get("summary", "Sem título")
+        print(f"\n→ Processando [{key}] {summary}")
+
+        context = build_issue_context(issue)
+
+        print("  Gerando conteúdo GitBook...")
+        gb_content = generate_content(SYSTEM_GITBOOK, context)
+
+        print("  Gerando comunicado Slack...")
+        sl_content = generate_content(SYSTEM_SLACK, context)
+
+        print("  Criando página no GitBook...")
+        page_id = create_gitbook_page(f"[{key}] {summary}", gb_content)
+        print(f"  ✓ Página criada: {page_id}")
+
+        print("  Publicando no Slack...")
+        ts = post_slack_message(sl_content)
+        print(f"  ✓ Mensagem publicada (ts: {ts})")
+
+        published.add(key)
+        save_published(published)
+
+    print(f"\n✅ Concluído. {len(novas)} issue(s) processada(s).")
+
+
+if __name__ == "__main__":
+    main()
